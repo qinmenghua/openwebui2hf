@@ -1,0 +1,163 @@
+name: 重新构建 Hugging Face 空间
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 19 * * *'  # 每天UTC 20:00 (北京时间凌晨3:00)
+env:
+  HF_TOKEN: ${{ secrets.HF_TOKEN }}
+  USERNAME: ${{ secrets.USERNAME }} # 可以选择将USERNAME也放到secrets
+  TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+  TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}  # 可以选择将TG_CHAT_ID也放到secrets
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v2
+      - name: 配置Python环境
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.9'
+      - name: 安装依赖包
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+      - name: 重新构建空间
+        id: rebuild
+        run: |
+          python <<EOF
+          import requests
+          import time
+          import os
+          
+          # 基础配置
+          HF_TOKEN = os.environ['HF_TOKEN']
+          USERNAME = os.environ['USERNAME']
+          
+          # 定义需要重新构建的空间列表
+          SPACE_LIST = [
+              "open-webui"
+          ]
+          
+          def rebuild_space(space_name):
+              """重新构建单个空间的函数"""
+              full_space_name = f"{USERNAME}/{space_name}"
+              print(f"\n{'='*50}")
+              print(f"🔄 开始重新构建空间：{full_space_name}")
+              
+              # API 接口
+              rebuild_url = f"https://huggingface.co/api/spaces/{full_space_name}/restart?factory=true"
+              status_url = f"https://huggingface.co/api/spaces/{full_space_name}/runtime"
+              
+              # 请求头
+              headers = {
+                  "Authorization": f"Bearer {HF_TOKEN}",
+                  "Content-Type": "application/json"
+              }
+              
+              try:
+                  # 发送重新构建请求
+                  response = requests.post(rebuild_url, headers=headers)
+                  
+                  if response.status_code == 200:
+                      print(f"✅ 重新构建请求已发送成功")
+                      
+                      # 检查重新构建状态
+                      max_attempts = 10  # 最大检查次数
+                      for attempt in range(max_attempts):
+                          print(f"⏳ 等待30秒后检查状态... (尝试 {attempt + 1}/{max_attempts})")
+                          time.sleep(30)
+                          
+                          try:
+                              status_response = requests.get(status_url, headers=headers)
+                              if status_response.status_code == 200:
+                                  status_data = status_response.json()
+                                  stage = status_data.get("stage", "")
+                                  print(f"当前状态: {stage}")
+                                  
+                                  if stage == "RUNNING":
+                                      print(f"✅ 空间 {space_name} 已成功重新构建!")
+                                      return True
+                                  elif stage == "RUNNING_BUILDING":
+                                      print("🏗️ 空间正在构建中...")
+                                  elif "ERROR" in stage:
+                                      print(f"❌ 检测到错误: {stage}")
+                                      return False
+                              else:
+                                  print(f"⚠️ 获取状态失败，状态码: {status_response.status_code}")
+                          except requests.RequestException as e:
+                              print(f"⚠️ 请求异常: {str(e)}")
+                      
+                      print("⚠️ 达到最大尝试次数，重新构建状态未知")
+                      return None
+                  
+                  else:
+                      print(f"❌ 重新构建请求失败. 状态码: {response.status_code}")
+                      print(f"响应内容: {response.text}")
+                      return False
+                  
+              except Exception as e:
+                  print(f"❌ 发生错误: {str(e)}")
+                  return False
+          
+          # 主程序：循环重新构建所有空间
+          success_spaces = []
+          failed_spaces = []
+          unknown_spaces = []
+          
+          print(f"🚀 准备重新构建以下空间: {', '.join(SPACE_LIST)}")
+          
+          for space in SPACE_LIST:
+              result = rebuild_space(space)
+              if result is True:
+                  success_spaces.append(space)
+              elif result is False:
+                  failed_spaces.append(space)
+              else:
+                  unknown_spaces.append(space)
+          
+          # 格式化输出
+          summary = f"总计空间数: {len(SPACE_LIST)}\n"
+          summary += f"成功数量: {len(success_spaces)}\n"
+          summary += f"失败数量: {len(failed_spaces)}\n"
+          summary += f"未知状态数量: {len(unknown_spaces)}\n"
+          summary += "---\n具体结果:\n"
+          summary += "\n".join([f"✅ {space} 重新构建成功" for space in success_spaces])
+          summary += "\n".join([f"❌ {space} 重新构建失败" for space in failed_spaces])
+          summary += "\n".join([f"❓ {space} 重新构建状态未知" for space in unknown_spaces])
+          
+          print("\n" + "="*50)
+          print("📊 重新构建总结:")
+          print(summary)
+          
+          # 保存结果到 GitHub Actions 输出
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              print("summary<<EOF", file=f)
+              print(summary, file=f)
+              print("EOF", file=f)
+              print(f"exit_code={1 if failed_spaces or unknown_spaces else 0}", file=f)
+          
+          if failed_spaces or unknown_spaces:
+              exit(1)
+          else:
+              exit(0)
+          EOF
+      - name: 发送 Telegram 通知
+        if: always()
+        run: |
+          SUMMARY="${{ steps.rebuild.outputs.summary }}"
+          # 使用 echo -e 来正确解释转义字符
+          MESSAGE=$(echo -e "Hugging Face 空间重新构建结果：\n${SUMMARY}")
+          curl -s -X POST https://api.telegram.org/bot${{ env.TG_BOT_TOKEN }}/sendMessage \
+               -d chat_id=${{ env.TG_CHAT_ID }} \
+               -d text="$MESSAGE" \
+               -d parse_mode=Markdown
+      - name: 检查重新构建结果
+        if: always()
+        run: |
+          exit ${{ steps.rebuild.outputs.exit_code }}
+      - name: 完成状态
+        if: always()
+        run: |
+          echo "🏁 重新构建流程已完成"
