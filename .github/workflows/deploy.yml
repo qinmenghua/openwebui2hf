@@ -37,7 +37,7 @@ jobs:
           
           # 定义需要重新构建的空间列表
           SPACE_LIST = [
-              "open-webui"
+              "openwebui"
           ]
           
           def rebuild_space(space_name):
