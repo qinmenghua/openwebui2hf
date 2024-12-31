@@ -1,4 +1,4 @@
-name: 部署或重新构建 Hugging Face 空间
+name: 部署并批量重新构建 Hugging Face 空间
 
 on:
   push:
@@ -28,7 +28,7 @@ jobs:
         if: "${{ env.HF_TOKEN != '' }}"
         run: echo "defined=true" >> $GITHUB_OUTPUT
 
-  deploy-or-rebuild:
+  deploy-and-rebuild:
     runs-on: ubuntu-latest
     needs: [check-secret]
     if: needs.check-secret.outputs.token-set == 'true'
@@ -59,13 +59,23 @@ jobs:
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --global user.name "github-actions[bot]"
 
+      - name: 设置 Git 并推送到抱抱脸空间
+        run: |
+          git init --initial-branch=main
+          git lfs install
+          git lfs track "*.ttf"
+          git lfs track "*.jpg"
+          git add .
+          git commit -m "GitHub deploy: ${{ github.sha }}"
+          git push --force https://${HF_USER}:${HF_TOKEN}@huggingface.co/spaces/${HF_USER}/${HF_REPO} main
+
       - name: 安装 Python 依赖
         run: |
           python -m pip install --upgrade pip
           pip install requests huggingface_hub
 
-      - name: 检查空间是否存在并执行相应操作
-        id: deploy-or-rebuild
+      - name: 批量重新构建空间
+        id: rebuild
         run: |
           python <<EOF
           import os
@@ -76,126 +86,116 @@ jobs:
           # 配置
           HF_TOKEN = os.environ['HF_TOKEN']
           USERNAME = os.environ['HF_USER']
-          SPACE_NAME = os.environ['HF_REPO']
 
-          # 初始化 Hugging Face API
+          # 定义需要重新构建的空间列表
+          SPACE_LIST = [
+              "open-webui",
+          ]
+
+          # 检查空间是否存在，如果不存在则创建
           api = HfApi(token=HF_TOKEN)
+          for space_name in SPACE_LIST:
+              try:
+                  api.repo_info(f"{USERNAME}/{space_name}", repo_type="space")
+                  print(f"空间 {space_name} 已存在，跳过创建。")
+              except Exception as e:
+                  print(f"空间 {space_name} 不存在，正在创建...")
+                  api.create_repo(
+                      repo_id=f"{USERNAME}/{space_name}",
+                      repo_type="space",
+                      space_sdk="docker",
+                      space_hardware="cpu-basic",
+                      private=False
+                  )
+                  print(f"空间 {space_name} 已成功创建。")
 
-          # 检查空间是否存在
-          try:
-              api.repo_info(f"{USERNAME}/{SPACE_NAME}", repo_type="space")
-              space_exists = True
-              print(f"空间 {SPACE_NAME} 已存在，将执行重新构建操作。")
-          except Exception as e:
-              space_exists = False
-              print(f"空间 {SPACE_NAME} 不存在，将执行部署操作。")
+          # 重新构建空间
+          def rebuild_space(space_name):
+              full_space_name = f"{USERNAME}/{space_name}"
+              print(f"\n{'='*50}")
+              print(f"🔄 开始重新构建空间：{full_space_name}")
 
-          # 如果空间不存在，创建并部署
-          if not space_exists:
-              print(f"正在创建空间 {SPACE_NAME}...")
-              api.create_repo(
-                  repo_id=f"{USERNAME}/{SPACE_NAME}",
-                  repo_type="space",
-                  space_sdk="docker",
-                  space_hardware="cpu-basic",
-                  private=False
-              )
-              print(f"空间 {SPACE_NAME} 已成功创建。")
+              rebuild_url = f"https://huggingface.co/api/spaces/{full_space_name}/restart?factory=true"
+              status_url = f"https://huggingface.co/api/spaces/{full_space_name}/runtime"
+              headers = {
+                  "Authorization": f"Bearer {HF_TOKEN}",
+                  "Content-Type": "application/json"
+              }
 
-              # 推送代码到空间
-              print(f"正在推送代码到空间 {SPACE_NAME}...")
-              os.system("git init --initial-branch=main")
-              os.system("git lfs install")
-              os.system("git lfs track '*.ttf'")
-              os.system("git lfs track '*.jpg'")
-              os.system("git add .")
-              os.system("git commit -m 'GitHub deploy: ${{ github.sha }}'")
-              os.system(f"git push --force https://{USERNAME}:{HF_TOKEN}@huggingface.co/spaces/{USERNAME}/{SPACE_NAME} main")
-              print(f"代码已成功推送到空间 {SPACE_NAME}。")
-
-          # 如果空间存在，重新构建
-          else:
-              print(f"正在重新构建空间 {SPACE_NAME}...")
-              def rebuild_space(space_name):
-                  full_space_name = f"{USERNAME}/{space_name}"
-                  print(f"\n{'='*50}")
-                  print(f"🔄 开始重新构建空间：{full_space_name}")
-
-                  rebuild_url = f"https://huggingface.co/api/spaces/{full_space_name}/restart?factory=true"
-                  status_url = f"https://huggingface.co/api/spaces/{full_space_name}/runtime"
-                  headers = {
-                      "Authorization": f"Bearer {HF_TOKEN}",
-                      "Content-Type": "application/json"
-                  }
-
-                  try:
-                      response = requests.post(rebuild_url, headers=headers)
-                      if response.status_code == 200:
-                          print(f"✅ 重新构建请求已发送成功")
-                          max_attempts = 10
-                          for attempt in range(max_attempts):
-                              print(f"⏳ 等待30秒后检查状态... (尝试 {attempt + 1}/{max_attempts})")
-                              time.sleep(30)
-                              status_response = requests.get(status_url, headers=headers)
-                              if status_response.status_code == 200:
-                                  status_data = status_response.json()
-                                  stage = status_data.get("stage", "")
-                                  print(f"当前状态: {stage}")
-                                  if stage == "RUNNING":
-                                      print(f"✅ 空间 {space_name} 已成功重新构建!")
-                                      return True
-                                  elif stage == "RUNNING_BUILDING":
-                                      print("🏗️ 空间正在构建中...")
-                                  elif "ERROR" in stage:
-                                      print(f"❌ 检测到错误: {stage}")
-                                      return False
-                              else:
-                                  print(f"⚠️ 获取状态失败，状态码: {status_response.status_code}")
-                          print("⚠️ 达到最大尝试次数，重新构建状态未知")
-                          return None
-                      else:
-                          print(f"❌ 重新构建请求失败. 状态码: {response.status_code}")
-                          print(f"响应内容: {response.text}")
-                          return False
-                  except Exception as e:
-                      print(f"❌ 发生错误: {str(e)}")
+              try:
+                  response = requests.post(rebuild_url, headers=headers)
+                  if response.status_code == 200:
+                      print(f"✅ 重新构建请求已发送成功")
+                      max_attempts = 10
+                      for attempt in range(max_attempts):
+                          print(f"⏳ 等待30秒后检查状态... (尝试 {attempt + 1}/{max_attempts})")
+                          time.sleep(30)
+                          status_response = requests.get(status_url, headers=headers)
+                          if status_response.status_code == 200:
+                              status_data = status_response.json()
+                              stage = status_data.get("stage", "")
+                              print(f"当前状态: {stage}")
+                              if stage == "RUNNING":
+                                  print(f"✅ 空间 {space_name} 已成功重新构建!")
+                                  return True
+                              elif stage == "RUNNING_BUILDING":
+                                  print("🏗️ 空间正在构建中...")
+                              elif "ERROR" in stage:
+                                  print(f"❌ 检测到错误: {stage}")
+                                  return False
+                          else:
+                              print(f"⚠️ 获取状态失败，状态码: {status_response.status_code}")
+                      print("⚠️ 达到最大尝试次数，重新构建状态未知")
+                      return None
+                  else:
+                      print(f"❌ 重新构建请求失败. 状态码: {response.status_code}")
+                      print(f"响应内容: {response.text}")
                       return False
+              except Exception as e:
+                  print(f"❌ 发生错误: {str(e)}")
+                  return False
 
-              result = rebuild_space(SPACE_NAME)
+          # 主程序
+          results = {}
+          for space_name in SPACE_LIST:
+              result = rebuild_space(space_name)
+              results[space_name] = result
+
+          # 生成总结信息
+          summary = "批量重新构建结果：\n"
+          for space_name, result in results.items():
               if result is True:
-                  summary = f"✅ 空间 {SPACE_NAME} 重新构建成功"
-                  exit_code = 0
+                  summary += f"✅ 空间 {space_name} 重新构建成功\n"
               elif result is False:
-                  summary = f"❌ 空间 {SPACE_NAME} 重新构建失败"
-                  exit_code = 1
+                  summary += f"❌ 空间 {space_name} 重新构建失败\n"
               else:
-                  summary = f"❓ 空间 {SPACE_NAME} 重新构建状态未知"
-                  exit_code = 1
+                  summary += f"❓ 空间 {space_name} 重新构建状态未知\n"
 
-              # 保存结果到 GitHub Actions 输出
-              with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-                  print(f"summary={summary}", file=f)
-                  print(f"exit_code={exit_code}", file=f)
+          # 保存结果到 GitHub Actions 输出
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              print(f"summary={summary}", file=f)
 
-              exit(exit_code)
+          # 如果有失败的空间，退出码为 1
+          if any(result is False for result in results.values()):
+              exit(1)
           EOF
 
       - name: 发送 Telegram 通知
         if: always()
         run: |
-          SUMMARY="${{ steps.deploy-or-rebuild.outputs.summary || '空间部署或重新构建已完成' }}"
-          MESSAGE=$(echo -e "Hugging Face 空间操作结果：\n${SUMMARY}")
+          SUMMARY="${{ steps.rebuild.outputs.summary }}"
+          MESSAGE=$(echo -e "Hugging Face 空间部署和批量重新构建结果：\n${SUMMARY}")
           curl -s -X POST https://api.telegram.org/bot${{ env.TG_BOT_TOKEN }}/sendMessage \
                -d chat_id=${{ env.TG_CHAT_ID }} \
                -d text="$MESSAGE" \
                -d parse_mode=Markdown
 
-      - name: 检查操作结果
+      - name: 检查重新构建结果
         if: always()
         run: |
-          exit ${{ steps.deploy-or-rebuild.outputs.exit_code || 0 }}
+          exit ${{ steps.rebuild.outputs.exit_code }}
 
       - name: 完成状态
         if: always()
         run: |
-          echo "🏁 部署或重新构建流程已完成"
+          echo "🏁 部署和批量重新构建流程已完成"
